@@ -1,78 +1,168 @@
-name: CI
+name: TOY SHOP CI
 
 on:
   pull_request:
-    branches: [main]
+    branches:
+      - main
   push:
-    branches: [main]
+    branches:
+      - main
 
-env:
-  AWS_REGION: us-east-1
-  ECR_REPOSITORY: toy-shop
+permissions:
+  contents: read
 
 jobs:
+
+  # -----------------------------------------
+  # 1. LINT
+  # -----------------------------------------
   lint:
     name: Lint
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "20"
           cache: npm
-      - run: npm ci
-      - run: npm run lint
 
-  trivy:
-    name: Trivy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: docker run --rm -v "$PWD:/src" aquasec/trivy:latest fs --scanners vuln --severity HIGH,CRITICAL --exit-code 0 /src
+      - name: Install dependencies
+        run: npm ci
 
-  sonar:
-    name: SonarQube
+      - name: Run ESLint
+        run: npm run lint
+
+
+  # -----------------------------------------
+  # 2. BUILD APPLICATION
+  # -----------------------------------------
+  build:
+    name: Build Application
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+
+  # -----------------------------------------
+  # 3. SONARQUBE
+  # -----------------------------------------
+  sonarqube:
+    name: SonarQube Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: SonarSource/sonarqube-scan-action@v5
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v6
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+          SONAR_HOST_URL: "http://3.19.79.0:9000"
 
-  build:
-    name: Build
-    needs: [lint, trivy, sonar]
+
+  # -----------------------------------------
+  # 4. TRIVY FILESYSTEM SCAN
+  # -----------------------------------------
+  trivy:
+    name: Trivy Security Scan
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy
+        uses: aquasecurity/trivy-action@master
         with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - run: npm run build
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
 
+
+  # -----------------------------------------
+  # 5. BUILD DOCKER IMAGE
+  # -----------------------------------------
   docker:
-    name: Build and push to ECR
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: Docker Build
     runs-on: ubuntu-latest
+
+    needs:
+      - lint
+      - build
+      - sonarqube
+      - trivy
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: aws-actions/configure-aws-credentials@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: |
+          docker build -t toy-shop:${{ github.sha }} .
+
+
+  # -----------------------------------------
+  # 6. PUSH IMAGE TO AMAZON ECR
+  # Only happens after code is merged/pushed to main
+  # -----------------------------------------
+  ecr:
+    name: Push to Amazon ECR
+    runs-on: ubuntu-latest
+
+    needs:
+      - docker
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-      - id: ecr
+          aws-region: us-east-2
+
+      - name: Login to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
-      - name: Build and push image
+
+      - name: Build and push Docker image
         env:
-          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: toy-shop
+          IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $REGISTRY/$ECR_REPOSITORY:latest -t $REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
-          docker push $REGISTRY/$ECR_REPOSITORY:latest
-          docker push $REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+
+          docker tag \
+            $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
